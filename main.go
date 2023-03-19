@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"database/sql"
@@ -18,11 +19,31 @@ import (
 )
 
 func main() {
-	router := mux.NewRouter()
 
-	router.HandleFunc("/upload", handleFileUpload).Methods("POST")
-	router.HandleFunc("/files", fetchUploadedFiles).Methods("GET")
+	db, err := connectToDatabase()
+    if err != nil {
+        log.Fatalf("Failed to connect to database: %v", err)
+    }
+    defer db.Close()
 
+	r := mux.NewRouter()
+
+	r.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
+        handleFileUpload(w, r, db)
+    }).Methods("POST", "OPTIONS")
+    r.HandleFunc("/files", func(w http.ResponseWriter, r *http.Request) {
+        fetchUploadedFiles(w, r, db)
+    }).Methods("GET", "OPTIONS")
+    r.HandleFunc("/files/{id}", func(w http.ResponseWriter, r *http.Request) {
+        deleteFile(w, r, db)
+    }).Methods("DELETE", "OPTIONS")
+
+	/* r.HandleFunc("/upload", handleFileUpload).Methods("POST")
+	r.HandleFunc("/files", fetchUploadedFiles).Methods("GET")
+	r.HandleFunc("/files/{id}", func(w http.ResponseWriter, r *http.Request) {
+		deleteFile(w, r, db)
+	  }).Methods("DELETE")
+ */
 	// Add CORS middleware
 	c := cors.New(cors.Options{
 		AllowedOrigins:   []string{"http://localhost:3000"}, // Change this to the appropriate origin in production
@@ -30,14 +51,14 @@ func main() {
 		AllowCredentials: true,
 	})
 
-	handler := c.Handler(router)
+	handler := c.Handler(r)
 
 	port := ":8080"
 	fmt.Println("Listening on port", port)
 	log.Fatal(http.ListenAndServe(port, handler))
 }
 
-func handleFileUpload(w http.ResponseWriter, r *http.Request) {
+func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	err := r.ParseMultipartForm(32 << 20) // 32 MB
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -50,6 +71,25 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+
+	 // Check the MIME type of the uploaded file
+	 buffer := make([]byte, 512)
+	 _, err = file.Read(buffer)
+	 if err != nil {
+	   http.Error(w, "Failed to read file", http.StatusBadRequest)
+	   return
+	 }
+	 contentType := http.DetectContentType(buffer)
+	 if contentType != "text/csv" && !strings.HasPrefix(contentType, "image/") {
+	   http.Error(w, "Invalid file type. Only CSV and image files are allowed", http.StatusBadRequest)
+	   return
+	 }
+	 _, err = file.Seek(0, io.SeekStart) // Reset the file read position
+	 if err != nil {
+	   http.Error(w, "Failed to read file", http.StatusBadRequest)
+	   return
+	 }
+
 
 	uploadPath := filepath.Join("uploads", handler.Filename)
 	err = os.MkdirAll(filepath.Dir(uploadPath), os.ModePerm)
@@ -83,13 +123,6 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db, err := connectToDatabase()
-	if err != nil {
-		http.Error(w, "Failed to connect to the database", http.StatusInternalServerError)
-		return
-	}
-	defer db.Close()
-
 	query := "INSERT INTO uploaded_files (file_name, file_size, datetime_uploaded) VALUES ($1, $2, $3)"
 	_, err = db.Exec(query, handler.Filename, handler.Size, time.Now())
 	fmt.Println(query, handler.Filename, handler.Size, handler.Header, time.Now())
@@ -111,14 +144,7 @@ func connectToDatabase() (*sql.DB, error) {
 }
 
 // Add a new function to fetch file information from the database
-func fetchUploadedFiles(w http.ResponseWriter, r *http.Request) {
-	db, err := connectToDatabase()
-	if err != nil {
-		http.Error(w, "Failed to connect to the database", http.StatusInternalServerError)
-		return
-	}
-	defer db.Close()
-
+func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {	
 	query := "SELECT file_name, file_size, datetime_uploaded FROM uploaded_files ORDER BY datetime_uploaded DESC"
 	rows, err := db.Query(query)
 	if err != nil {
@@ -147,3 +173,17 @@ func fetchUploadedFiles(w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(fileInfos)
 }
+
+func deleteFile(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+  
+	_, err := db.Exec("DELETE FROM uploaded_files WHERE id = $1", id)
+	if err != nil {
+	  http.Error(w, "Failed to delete file", http.StatusInternalServerError)
+	  return
+	}
+  
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("File deleted successfully"))
+  }
