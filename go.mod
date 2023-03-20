@@ -7,4 +7,7 @@ require (
 	github.com/rs/cors v1.8.3
 )
 
-require github.com/lib/pq v1.10.7
+require (
+	github.com/lib/pq v1.10.7
+	golang.org/x/text v0.8.0
+)

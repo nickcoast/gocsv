@@ -1,49 +1,56 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"database/sql"
 
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
 	"github.com/rs/cors"
+	"golang.org/x/text/runes"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 )
 
 func main() {
 
 	db, err := connectToDatabase()
-    if err != nil {
-        log.Fatalf("Failed to connect to database: %v", err)
-    }
-    defer db.Close()
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer db.Close()
 
 	r := mux.NewRouter()
 
 	r.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
-        handleFileUpload(w, r, db)
-    }).Methods("POST", "OPTIONS")
-    r.HandleFunc("/files", func(w http.ResponseWriter, r *http.Request) {
-        fetchUploadedFiles(w, r, db)
-    }).Methods("GET", "OPTIONS")
-    r.HandleFunc("/files/{id}", func(w http.ResponseWriter, r *http.Request) {
-        deleteFile(w, r, db)
-    }).Methods("DELETE", "OPTIONS")
+		handleFileUpload(w, r, db)
+	}).Methods("POST", "OPTIONS")
+	r.HandleFunc("/files", func(w http.ResponseWriter, r *http.Request) {
+		fetchUploadedFiles(w, r, db)
+	}).Methods("GET", "OPTIONS")
+	r.HandleFunc("/files/{id}", func(w http.ResponseWriter, r *http.Request) {
+		deleteFile(w, r, db)
+	}).Methods("DELETE", "OPTIONS")
 
 	/* r.HandleFunc("/upload", handleFileUpload).Methods("POST")
 	r.HandleFunc("/files", fetchUploadedFiles).Methods("GET")
 	r.HandleFunc("/files/{id}", func(w http.ResponseWriter, r *http.Request) {
 		deleteFile(w, r, db)
 	  }).Methods("DELETE")
- */
+	*/
 	// Add CORS middleware
 	c := cors.New(cors.Options{
 		AllowedOrigins:   []string{"http://localhost:3000"}, // Change this to the appropriate origin in production
@@ -72,24 +79,23 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 	defer file.Close()
 
-	 // Check the MIME type of the uploaded file
-	 buffer := make([]byte, 512)
-	 _, err = file.Read(buffer)
-	 if err != nil {
-	   http.Error(w, "Failed to read file", http.StatusBadRequest)
-	   return
-	 }
-	 contentType := http.DetectContentType(buffer)
-	 if contentType != "text/csv" && !strings.HasPrefix(contentType, "image/") {
-	   http.Error(w, "Invalid file type. Only CSV and image files are allowed", http.StatusBadRequest)
-	   return
-	 }
-	 _, err = file.Seek(0, io.SeekStart) // Reset the file read position
-	 if err != nil {
-	   http.Error(w, "Failed to read file", http.StatusBadRequest)
-	   return
-	 }
-
+	// Check the MIME type of the uploaded file
+	buffer := make([]byte, 512)
+	_, err = file.Read(buffer)
+	if err != nil {
+		http.Error(w, "Failed to read file", http.StatusBadRequest)
+		return
+	}
+	contentType := http.DetectContentType(buffer)
+	if contentType != "text/csv" && contentType != "text/plain; charset=utf-8" && !strings.HasPrefix(contentType, "image/") {
+		http.Error(w, "Invalid file type. Only CSV and image files are allowed", http.StatusBadRequest)
+		return
+	}
+	_, err = file.Seek(0, io.SeekStart) // Reset the file read position
+	if err != nil {
+		http.Error(w, "Failed to read file", http.StatusBadRequest)
+		return
+	}
 
 	uploadPath := filepath.Join("uploads", handler.Filename)
 	err = os.MkdirAll(filepath.Dir(uploadPath), os.ModePerm)
@@ -131,6 +137,12 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
+	//tableName := "your_table_name" // Generate or define a table name based on your requirements
+	tableName := toPostgreSQLName(handler.Filename)
+	if err := createTableForCSV(file, tableName, db); err != nil {
+		log.Printf("Error creating table for CSV: %v", err)
+	}
+
 	fmt.Fprintf(w, "File uploaded successfully: %s", handler.Filename)
 }
 
@@ -144,8 +156,8 @@ func connectToDatabase() (*sql.DB, error) {
 }
 
 // Add a new function to fetch file information from the database
-func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {	
-	query := "SELECT file_name, file_size, datetime_uploaded FROM uploaded_files ORDER BY datetime_uploaded DESC"
+func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	query := "SELECT id, file_name, file_size, datetime_uploaded FROM uploaded_files ORDER BY datetime_uploaded DESC"
 	rows, err := db.Query(query)
 	if err != nil {
 		http.Error(w, "Failed to fetch file information from the database", http.StatusInternalServerError)
@@ -154,6 +166,7 @@ func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	defer rows.Close()
 
 	type FileInfo struct {
+		Id               int64     `json:"id"`
 		FileName         string    `json:"file_name"`
 		FileSize         int64     `json:"file_size"`
 		DatetimeUploaded time.Time `json:"datetime_uploaded"`
@@ -163,7 +176,7 @@ func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 	for rows.Next() {
 		var fileInfo FileInfo
-		err := rows.Scan(&fileInfo.FileName, &fileInfo.FileSize, &fileInfo.DatetimeUploaded)
+		err := rows.Scan(&fileInfo.Id, &fileInfo.FileName, &fileInfo.FileSize, &fileInfo.DatetimeUploaded)
 		if err != nil {
 			http.Error(w, "Failed to read file information from the database", http.StatusInternalServerError)
 			return
@@ -177,13 +190,59 @@ func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 func deleteFile(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	vars := mux.Vars(r)
 	id := vars["id"]
-  
+
 	_, err := db.Exec("DELETE FROM uploaded_files WHERE id = $1", id)
 	if err != nil {
-	  http.Error(w, "Failed to delete file", http.StatusInternalServerError)
-	  return
+		http.Error(w, "Failed to delete file", http.StatusInternalServerError)
+		return
 	}
-  
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("File deleted successfully"))
-  }
+}
+
+func createTableForCSV(file multipart.File, tableName string, db *sql.DB) error {
+	// Read the first line of the CSV file to get the column headers
+	file.Seek(0, 0)
+	reader := csv.NewReader(file)
+	headers, err := reader.Read()
+	if err != nil {
+		return fmt.Errorf("error reading CSV file: %w", err)
+	}
+
+	//tableName := toPostgreSQLName(file.Name)
+	// Create the table schema using the column headers
+	columns := []string{"id SERIAL PRIMARY KEY"}
+	for _, header := range headers {
+		// Replace any spaces in the column header with underscores
+		columnName := toPostgreSQLName(header)
+		columns = append(columns, fmt.Sprintf("%s VARCHAR(255)", columnName))
+	}
+	schema := strings.Join(columns, ", ")	
+
+	_, err = db.Exec(fmt.Sprintf("CREATE TABLE %s (%s);", tableName, schema))
+	if err != nil {
+		return fmt.Errorf("error creating table: %w", err)
+	}
+
+	return nil
+}
+
+
+func toPostgreSQLName(s string) string {
+	// Convert non-ASCII characters to their ASCII equivalents
+	t := transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
+	asciiStr, _, _ := transform.String(t, s)
+
+	// Make all characters lowercase
+	lowercaseStr := strings.ToLower(asciiStr)
+
+	// Replace all spaces with underscores
+	underscoreStr := strings.ReplaceAll(lowercaseStr, " ", "_")
+
+	// Remove extra underscores (at the beginning, end, and consecutive underscores)
+	re := regexp.MustCompile(`^_+|_+$|_{2,}`)
+	cleanStr := re.ReplaceAllString(underscoreStr, "")
+
+	return cleanStr
+}
