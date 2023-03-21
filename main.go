@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"database/sql"
 
@@ -129,16 +130,16 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	query := "INSERT INTO uploaded_files (file_name, file_size, datetime_uploaded) VALUES ($1, $2, $3)"
+	tableName := toPostgreSQLName(handler.Filename)
+
+	query := "INSERT INTO uploaded_files (file_name, file_size, datetime_uploaded, table_name) VALUES ($1, $2, $3, $4)"
 	_, err = db.Exec(query, handler.Filename, handler.Size, time.Now())
-	fmt.Println(query, handler.Filename, handler.Size, handler.Header, time.Now())
+	fmt.Println(query, handler.Filename, handler.Size, handler.Header, time.Now(), tableName)
 	if err != nil {
 		http.Error(w, "Failed to save file information to the database", http.StatusInternalServerError)
 		return
 	}
 
-	//tableName := "your_table_name" // Generate or define a table name based on your requirements
-	tableName := toPostgreSQLName(handler.Filename)
 	if err := createTableForCSV(file, tableName, db); err != nil {
 		log.Printf("Error creating table for CSV: %v", err)
 	}
@@ -218,7 +219,7 @@ func createTableForCSV(file multipart.File, tableName string, db *sql.DB) error 
 		columnName := toPostgreSQLName(header)
 		columns = append(columns, fmt.Sprintf("%s VARCHAR(255)", columnName))
 	}
-	schema := strings.Join(columns, ", ")	
+	schema := strings.Join(columns, ", ")
 
 	_, err = db.Exec(fmt.Sprintf("CREATE TABLE %s (%s);", tableName, schema))
 	if err != nil {
@@ -228,8 +229,10 @@ func createTableForCSV(file multipart.File, tableName string, db *sql.DB) error 
 	return nil
 }
 
-
 func toPostgreSQLName(s string) string {
+	if strings.ToLower(filepath.Ext(s)) == ".csv" {
+		s = strings.TrimSuffix(s, filepath.Ext(s))
+	}
 	// Convert non-ASCII characters to their ASCII equivalents
 	t := transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
 	asciiStr, _, _ := transform.String(t, s)
@@ -237,12 +240,29 @@ func toPostgreSQLName(s string) string {
 	// Make all characters lowercase
 	lowercaseStr := strings.ToLower(asciiStr)
 
-	// Replace all spaces with underscores
-	underscoreStr := strings.ReplaceAll(lowercaseStr, " ", "_")
+	asciiRe := regexp.MustCompile(`[^a-zA-Z0-9\n]`)
+	underscoreStr := asciiRe.ReplaceAllString(lowercaseStr, "_")
 
-	// Remove extra underscores (at the beginning, end, and consecutive underscores)
-	re := regexp.MustCompile(`^_+|_+$|_{2,}`)
+	// Replace all spaces with underscores
+	//underscoreStr := strings.ReplaceAll(asciiString, " ", "_")
+
+	re := regexp.MustCompile(`^[0-9]+`)
 	cleanStr := re.ReplaceAllString(underscoreStr, "")
+	// Remove extra underscores (at the beginning, end, and consecutive underscores)
+	re = regexp.MustCompile(`^[0-9_]+|_+$`)
+	cleanStr = re.ReplaceAllString(cleanStr, "")
+
+	re = regexp.MustCompile(`_{2,}`)
+	cleanStr = re.ReplaceAllString(cleanStr, "_")
+
+	maxLen := 59 // 63 is max, but cutting 4 more off to leave room for table name prefixes
+	runeCont := utf8.RuneCountInString(cleanStr)
+
+	if runeCont > maxLen {
+		r := []rune(cleanStr)
+		trunc := r[:maxLen]
+		cleanStr = string(trunc)
+	}
 
 	return cleanStr
 }
