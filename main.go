@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/csv"
 	"encoding/hex"
@@ -20,8 +21,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"database/sql"
-
 	"github.com/gorilla/mux"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
@@ -29,11 +28,13 @@ import (
 	"golang.org/x/text/runes"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
+	"github.com/nickcoast/gocsv/db"
 )
 
 func main() {
+	connStr := "user=ogrego password=vagrant dbname=ogrego host=localhost sslmode=disable"
+	db, err := db.NewDB(connStr)
 
-	db, err := connectToDatabase()
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
@@ -77,13 +78,14 @@ func main() {
 	log.Fatal(http.ListenAndServe(port, handler))
 }
 
-func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
-
-	tx, err := db.Begin()
+func handleFileUpload(w http.ResponseWriter, r *http.Request, db *db.DB) {
+	ctx := r.Context()
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		http.Error(w, "Error starting transaction", http.StatusInternalServerError)
 		return
 	}
+	defer tx.Rollback()
 
 	err = r.ParseMultipartForm(32 << 20) // 32 MB
 	if err != nil {
@@ -121,7 +123,7 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		//tableName := toPostgreSQLName(handler.Filename)
 
 		sequenceName := "core_raw_tables_id_seq"
-		lastValue, err := getLastSequenceValue(tx, sequenceName)
+		lastValue, err := getLastSequenceValue(ctx, tx, sequenceName)
 		if err != nil {
 			log.Printf("Error getting last sequence value: %v", err)
 			http.Error(w, "Error processing file", http.StatusInternalServerError)
@@ -149,7 +151,7 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		}
 
 		query := "INSERT INTO core_raw_tables (source_filename, file_size, datetime_uploaded, name, file_hash, file_hash_no_bom, file_hash_trimmed_no_bom) VALUES ($1, $2, $3, $4, $5, $6, $7)" // could add "RETURNING id"
-		_, err = tx.Exec(query, handler.Filename, handler.Size, time.Now(), tableName, fileHash, fileHashNoBOM, fileHashTrimmedNoBOM)
+		_, err = tx.ExecContext(ctx, query, handler.Filename, handler.Size, time.Now(), tableName, fileHash, fileHashNoBOM, fileHashTrimmedNoBOM)
 		fmt.Println(query+"\n", handler.Filename+"\n", handler.Size, handler.Header, time.Now(), tableName+"\n")
 		if err != nil {
 			fmt.Print(err)
@@ -157,7 +159,7 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			return
 		}
 
-		columnNames, err := createTableForCSV(tx, file, tableName)
+		columnNames, err := createTableForCSV(ctx, tx, file, tableName)
 		if err != nil {
 			tx.Rollback()
 			log.Println("Error creating table:", err)
@@ -165,7 +167,7 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			return
 		}
 
-		err = importCSVDataToTable(tx, file, tableName, columnNames)
+		err = importCSVDataToTable(ctx, tx, file, tableName, columnNames)
 		if err != nil {
 			log.Println("Error importing data:", err)
 			txErr := tx.Rollback()
@@ -222,23 +224,14 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	fmt.Fprintf(w, "File uploaded successfully: %s", handler.Filename)
 }
 
-func connectToDatabase() (*sql.DB, error) {
-	connStr := "user=ogrego password=vagrant dbname=ogrego host=localhost sslmode=disable"
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		return nil, err
-	}
-	return db, nil
-}
-
 // Add a new function to fetch file information from the database
-func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
-	query := "SELECT id, file_name, file_size, datetime_uploaded FROM core_raw_tables ORDER BY datetime_uploaded DESC"
-	query = `SELECT u.id, u.source_filename, u.file_size, u.datetime_uploaded, COALESCE(c.name, '') as format_name
+func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *db.DB) {
+	ctx := r.Context()
+	query := `SELECT u.id, u.source_filename, u.file_size, u.datetime_uploaded, COALESCE(c.name, '') as format_name
 	FROM core_raw_tables u
 	LEFT JOIN core_import_formats c ON u.format_id = c.id
 	ORDER BY u.datetime_uploaded DESC;`
-	rows, err := db.Query(query)
+	rows, err := db.QueryWithContext(ctx, query)
 	if err != nil {
 		http.Error(w, "Failed to fetch file information from the database", http.StatusInternalServerError)
 		return
@@ -268,11 +261,17 @@ func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	json.NewEncoder(w).Encode(fileInfos)
 }
 
-func deleteFile(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+func deleteFile(w http.ResponseWriter, r *http.Request, db *db.DB) {
+	ctx := r.Context()
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		http.Error(w, "Error starting transaction", http.StatusInternalServerError)
+		return
+	}
 	vars := mux.Vars(r)
 	id := vars["id"]
 
-	_, err := db.Exec("DELETE FROM core_raw_tables WHERE id = $1", id)
+	_, err = tx.ExecContext(ctx, "DELETE FROM core_raw_tables WHERE id = $1", id)
 	if err != nil {
 		http.Error(w, "Failed to delete file", http.StatusInternalServerError)
 		return
@@ -285,7 +284,7 @@ func deleteFile(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 // Returns column names
 // Creates table in DB, skipping completely empty columns and rows
 // For zero-length columns with headers, sets to VARCHAR(1)
-func createTableForCSV(tx *sql.Tx, file multipart.File, tableName string) ([]string, error) {
+func createTableForCSV(ctx context.Context, tx *db.Tx, file multipart.File, tableName string) ([]string, error) {
 	// Read the first line of the CSV file to get the column headers
 	file.Seek(0, 0)
 	maxLengths, headerLengths, err := getMaxColumnLengths(file)
@@ -319,7 +318,7 @@ func createTableForCSV(tx *sql.Tx, file multipart.File, tableName string) ([]str
 	}
 	schema := strings.Join(columns, ", ")
 
-	_, err = tx.Exec(fmt.Sprintf("CREATE TABLE %s (%s);", tableName, schema))
+	_, err = tx.ExecContext(ctx, fmt.Sprintf("CREATE TABLE %s (%s);", tableName, schema))
 	if err != nil {
 		return nil, fmt.Errorf("error creating table: %w", err)
 	}
@@ -404,11 +403,11 @@ func getMaxColumnLengths(reader io.Reader) ([]int, []int, error) {
 	return maxLengths, headerLengths, nil
 }
 
-func importCSVDataToTable(tx *sql.Tx, file multipart.File, tableName string, columnNames []string) error {
+func importCSVDataToTable(ctx context.Context, tx *db.Tx, file multipart.File, tableName string, columnNames []string) error {
 	// Reset the file position to the beginning
 	file.Seek(0, 0)
 
-	stmt, err := tx.Prepare(pq.CopyIn(tableName, columnNames...))
+	stmt, err := tx.PrepareContext(ctx, pq.CopyIn(tableName, columnNames...))
 	if err != nil {
 		return fmt.Errorf("error preparing COPY statement: %w", err)
 	}
@@ -434,13 +433,13 @@ func importCSVDataToTable(tx *sql.Tx, file multipart.File, tableName string, col
 			recordInterface[i] = v
 		}
 
-		_, err = stmt.Exec(recordInterface...)
+		_, err = stmt.ExecContext(ctx, recordInterface...)
 		if err != nil {
 			return fmt.Errorf("error executing COPY statement: %w", err)
 		}
 	}
 
-	_, err = stmt.Exec()
+	_, err = stmt.ExecContext(ctx)
 	if err != nil {
 		return fmt.Errorf("error executing COPY statement: %w", err)
 	}
@@ -453,13 +452,15 @@ func importCSVDataToTable(tx *sql.Tx, file multipart.File, tableName string, col
 	return nil
 }
 
-func getImportFormatsHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+func getImportFormatsHandler(w http.ResponseWriter, r *http.Request, db *db.DB) {
 	formats := []struct {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
 	}{}
 
-	rows, err := db.Query("SELECT id, name FROM core_import_formats;")
+	ctx := r.Context()
+
+	rows, err := db.QueryWithContext(ctx, "SELECT id, name FROM core_import_formats;")
 	if err != nil {
 		http.Error(w, "Failed to retrieve import formats", http.StatusInternalServerError)
 		return
@@ -483,11 +484,14 @@ func getImportFormatsHandler(w http.ResponseWriter, r *http.Request, db *sql.DB)
 	json.NewEncoder(w).Encode(formats)
 }
 
-func updateFileFormatHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+func updateFileFormatHandler(w http.ResponseWriter, r *http.Request, db *db.DB) {
 	fileID := r.FormValue("file_id")
 	formatID := r.FormValue("format_id")
 
-	_, err := db.Exec("UPDATE core_raw_tables SET format_id = $1 WHERE id = $2;", formatID, fileID)
+	ctx := r.Context()
+	tx, err := db.BeginTx(ctx)
+
+	_, err = tx.ExecContext(ctx, "UPDATE core_raw_tables SET format_id = $1 WHERE id = $2;", formatID, fileID)
 	if err != nil {
 		http.Error(w, "Failed to set import format", http.StatusInternalServerError)
 		return
@@ -496,12 +500,13 @@ func updateFileFormatHandler(w http.ResponseWriter, r *http.Request, db *sql.DB)
 	w.WriteHeader(http.StatusOK)
 }
 
-func getLastSequenceValue(tx *sql.Tx, sequenceName string) (int, error) {
+func getLastSequenceValue(ctx context.Context, tx *db.Tx, sequenceName string) (int, error) {
 	if sequenceName == "" {
 		sequenceName = "core_raw_tables_id_seq"
 	}
 	var lastValue int
-	err := tx.QueryRow(`SELECT last_value FROM ` + sequenceName).Scan(&lastValue)
+	
+	err := tx.QueryRowContext(ctx, `SELECT last_value FROM `+sequenceName).Scan(&lastValue)
 	if err != nil {
 		return 0, fmt.Errorf("error getting last value from sequence %s: %w", sequenceName, err)
 	}
