@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"crypto/sha256"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +23,7 @@ import (
 	"database/sql"
 
 	"github.com/gorilla/mux"
+	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 	"github.com/rs/cors"
 	"golang.org/x/text/runes"
@@ -45,6 +50,12 @@ func main() {
 	r.HandleFunc("/files/{id}", func(w http.ResponseWriter, r *http.Request) {
 		deleteFile(w, r, db)
 	}).Methods("DELETE", "OPTIONS")
+	r.HandleFunc("/import-formats", func(w http.ResponseWriter, r *http.Request) {
+		getImportFormatsHandler(w, r, db)
+	}).Methods("GET", "OPTIONS")
+	r.HandleFunc("/update-file-format", func(w http.ResponseWriter, r *http.Request) {
+		updateFileFormatHandler(w, r, db)
+	}).Methods("GET", "OPTIONS")
 
 	/* r.HandleFunc("/upload", handleFileUpload).Methods("POST")
 	r.HandleFunc("/files", fetchUploadedFiles).Methods("GET")
@@ -67,7 +78,14 @@ func main() {
 }
 
 func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
-	err := r.ParseMultipartForm(32 << 20) // 32 MB
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "Error starting transaction", http.StatusInternalServerError)
+		return
+	}
+
+	err = r.ParseMultipartForm(32 << 20) // 32 MB
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -92,6 +110,77 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		http.Error(w, "Invalid file type. Only CSV and image files are allowed", http.StatusBadRequest)
 		return
 	}
+
+	if contentType == "text/csv" || contentType == "text/plain; charset=utf-8" {
+		file.Seek(0, 0)
+		if err != nil {
+			log.Println("Error getting max column lengths:", err)
+			http.Error(w, "Error processing CSV file", http.StatusInternalServerError)
+			return
+		}
+		//tableName := toPostgreSQLName(handler.Filename)
+
+		sequenceName := "core_raw_tables_id_seq"
+		lastValue, err := getLastSequenceValue(tx, sequenceName)
+		if err != nil {
+			log.Printf("Error getting last sequence value: %v", err)
+			http.Error(w, "Error processing file", http.StatusInternalServerError)
+			return
+		}
+		tableName := fmt.Sprintf("raw_table_%d", lastValue+1)
+
+		// Calculate the file hash
+		file.Seek(0, 0)
+		fileHash, err := calculateFileHash(file)
+		if err != nil {
+			log.Println("Error calculating file hash:", err)
+			return
+		}
+
+		// Calculate the file hash without BOM
+		file.Seek(0, 0)
+		fileNoBOM := removeBOM(file)
+		fileHashNoBOM, err := calculateFileHash(fileNoBOM)
+		fileTrimmedNoBOM, err := removeEmptyRows(fileNoBOM)
+		fileHashTrimmedNoBOM, err := calculateFileHash(fileTrimmedNoBOM)
+		if err != nil {
+			log.Println("Error calculating file hash without BOM:", err)
+			return
+		}
+
+		query := "INSERT INTO core_raw_tables (source_filename, file_size, datetime_uploaded, name, file_hash, file_hash_no_bom, file_hash_trimmed_no_bom) VALUES ($1, $2, $3, $4, $5, $6, $7)" // could add "RETURNING id"
+		_, err = tx.Exec(query, handler.Filename, handler.Size, time.Now(), tableName, fileHash, fileHashNoBOM, fileHashTrimmedNoBOM)
+		fmt.Println(query+"\n", handler.Filename+"\n", handler.Size, handler.Header, time.Now(), tableName+"\n")
+		if err != nil {
+			fmt.Print(err)
+			http.Error(w, "Failed to save file information to the database", http.StatusInternalServerError)
+			return
+		}
+
+		columnNames, err := createTableForCSV(tx, file, tableName)
+		if err != nil {
+			tx.Rollback()
+			log.Println("Error creating table:", err)
+			http.Error(w, "Error creating table", http.StatusInternalServerError)
+			return
+		}
+
+		err = importCSVDataToTable(tx, file, tableName, columnNames)
+		if err != nil {
+			log.Println("Error importing data:", err)
+			txErr := tx.Rollback()
+			log.Println("Tx error:", txErr)
+			http.Error(w, "Error importing data", http.StatusInternalServerError)
+			return
+		}
+		err = tx.Commit()
+		if err != nil {
+			http.Error(w, "Error committing transaction", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	}
+
 	_, err = file.Seek(0, io.SeekStart) // Reset the file read position
 	if err != nil {
 		http.Error(w, "Failed to read file", http.StatusBadRequest)
@@ -130,20 +219,6 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	tableName := toPostgreSQLName(handler.Filename)
-
-	query := "INSERT INTO uploaded_files (file_name, file_size, datetime_uploaded, table_name) VALUES ($1, $2, $3, $4)"
-	_, err = db.Exec(query, handler.Filename, handler.Size, time.Now())
-	fmt.Println(query, handler.Filename, handler.Size, handler.Header, time.Now(), tableName)
-	if err != nil {
-		http.Error(w, "Failed to save file information to the database", http.StatusInternalServerError)
-		return
-	}
-
-	if err := createTableForCSV(file, tableName, db); err != nil {
-		log.Printf("Error creating table for CSV: %v", err)
-	}
-
 	fmt.Fprintf(w, "File uploaded successfully: %s", handler.Filename)
 }
 
@@ -158,7 +233,11 @@ func connectToDatabase() (*sql.DB, error) {
 
 // Add a new function to fetch file information from the database
 func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
-	query := "SELECT id, file_name, file_size, datetime_uploaded FROM uploaded_files ORDER BY datetime_uploaded DESC"
+	query := "SELECT id, file_name, file_size, datetime_uploaded FROM core_raw_tables ORDER BY datetime_uploaded DESC"
+	query = `SELECT u.id, u.source_filename, u.file_size, u.datetime_uploaded, COALESCE(c.name, '') as format_name
+	FROM core_raw_tables u
+	LEFT JOIN core_import_formats c ON u.format_id = c.id
+	ORDER BY u.datetime_uploaded DESC;`
 	rows, err := db.Query(query)
 	if err != nil {
 		http.Error(w, "Failed to fetch file information from the database", http.StatusInternalServerError)
@@ -168,8 +247,9 @@ func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 	type FileInfo struct {
 		Id               int64     `json:"id"`
-		FileName         string    `json:"file_name"`
+		FileName         string    `json:"source_filename"`
 		FileSize         int64     `json:"file_size"`
+		ImportFormat     string    `json:"format_name"`
 		DatetimeUploaded time.Time `json:"datetime_uploaded"`
 	}
 
@@ -177,7 +257,7 @@ func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 	for rows.Next() {
 		var fileInfo FileInfo
-		err := rows.Scan(&fileInfo.Id, &fileInfo.FileName, &fileInfo.FileSize, &fileInfo.DatetimeUploaded)
+		err := rows.Scan(&fileInfo.Id, &fileInfo.FileName, &fileInfo.FileSize, &fileInfo.DatetimeUploaded, &fileInfo.ImportFormat)
 		if err != nil {
 			http.Error(w, "Failed to read file information from the database", http.StatusInternalServerError)
 			return
@@ -192,7 +272,7 @@ func deleteFile(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	vars := mux.Vars(r)
 	id := vars["id"]
 
-	_, err := db.Exec("DELETE FROM uploaded_files WHERE id = $1", id)
+	_, err := db.Exec("DELETE FROM core_raw_tables WHERE id = $1", id)
 	if err != nil {
 		http.Error(w, "Failed to delete file", http.StatusInternalServerError)
 		return
@@ -202,31 +282,49 @@ func deleteFile(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	w.Write([]byte("File deleted successfully"))
 }
 
-func createTableForCSV(file multipart.File, tableName string, db *sql.DB) error {
+// Returns column names
+// Creates table in DB, skipping completely empty columns and rows
+// For zero-length columns with headers, sets to VARCHAR(1)
+func createTableForCSV(tx *sql.Tx, file multipart.File, tableName string) ([]string, error) {
 	// Read the first line of the CSV file to get the column headers
 	file.Seek(0, 0)
+	maxLengths, headerLengths, err := getMaxColumnLengths(file)
+	if err != nil {
+		log.Println("Error getting max column lengths:", err)
+		return nil, err
+	}
+	// Reset the reader position before reading headers
+	file.Seek(0, 0)
+
 	reader := csv.NewReader(file)
 	headers, err := reader.Read()
 	if err != nil {
-		return fmt.Errorf("error reading CSV file: %w", err)
+		return nil, fmt.Errorf("error reading CSV file: %w", err)
 	}
 
-	//tableName := toPostgreSQLName(file.Name)
 	// Create the table schema using the column headers
-	columns := []string{"id SERIAL PRIMARY KEY"}
-	for _, header := range headers {
-		// Replace any spaces in the column header with underscores
+	columns := []string{"_id SERIAL PRIMARY KEY"} // use underscore prefix for system column names
+	columnNames := []string{}                     // exclude system column names
+	for i, header := range headers {
+		if maxLengths[i] == 0 && headerLengths[i] == 0 {
+			continue // skip this column
+		}
 		columnName := toPostgreSQLName(header)
-		columns = append(columns, fmt.Sprintf("%s VARCHAR(255)", columnName))
+		columnLength := maxLengths[i]
+		if columnLength < 1 { // 0-length varchar not allowed in Postgres? (allowed in MySQL)
+			columnLength = 1
+		}
+		columns = append(columns, fmt.Sprintf("%s VARCHAR(%d)", columnName, columnLength))
+		columnNames = append(columnNames, columnName)
 	}
 	schema := strings.Join(columns, ", ")
 
-	_, err = db.Exec(fmt.Sprintf("CREATE TABLE %s (%s);", tableName, schema))
+	_, err = tx.Exec(fmt.Sprintf("CREATE TABLE %s (%s);", tableName, schema))
 	if err != nil {
-		return fmt.Errorf("error creating table: %w", err)
+		return nil, fmt.Errorf("error creating table: %w", err)
 	}
 
-	return nil
+	return columnNames, nil
 }
 
 func toPostgreSQLName(s string) string {
@@ -265,4 +363,212 @@ func toPostgreSQLName(s string) string {
 	}
 
 	return cleanStr
+}
+
+func getMaxColumnLengths(reader io.Reader) ([]int, []int, error) {
+	csvReader := csv.NewReader(reader)
+
+	headerRow, err := csvReader.Read()
+	if err != nil {
+		log.Println("Error reading CSV header:", err)
+		return nil, nil, err
+	}
+
+	maxLengths := []int{}
+	headerLengths := make([]int, len(headerRow))
+	// header row lengths
+	for i, cell := range headerRow {
+		headerLengths[i] = len(cell)
+	}
+
+	for {
+		row, err := csvReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Println("Error reading CSV:", err)
+			return nil, nil, err
+		}
+
+		for i, cell := range row {
+			cellLength := len(cell)
+			if i >= len(maxLengths) {
+				maxLengths = append(maxLengths, cellLength)
+			} else if cellLength > maxLengths[i] {
+				maxLengths[i] = cellLength
+			}
+		}
+	}
+
+	return maxLengths, headerLengths, nil
+}
+
+func importCSVDataToTable(tx *sql.Tx, file multipart.File, tableName string, columnNames []string) error {
+	// Reset the file position to the beginning
+	file.Seek(0, 0)
+
+	stmt, err := tx.Prepare(pq.CopyIn(tableName, columnNames...))
+	if err != nil {
+		return fmt.Errorf("error preparing COPY statement: %w", err)
+	}
+
+	reader := csv.NewReader(file)
+	_, err = reader.Read() // Skip header row
+	if err != nil {
+		return fmt.Errorf("error reading CSV file: %w", err)
+	}
+
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("error reading CSV file: %w", err)
+		}
+
+		// Convert the record slice of string to a slice of interface{}
+		recordInterface := make([]interface{}, len(record))
+		for i, v := range record {
+			recordInterface[i] = v
+		}
+
+		_, err = stmt.Exec(recordInterface...)
+		if err != nil {
+			return fmt.Errorf("error executing COPY statement: %w", err)
+		}
+	}
+
+	_, err = stmt.Exec()
+	if err != nil {
+		return fmt.Errorf("error executing COPY statement: %w", err)
+	}
+
+	err = stmt.Close()
+	if err != nil {
+		return fmt.Errorf("error closing COPY statement: %w", err)
+	}
+
+	return nil
+}
+
+func getImportFormatsHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	formats := []struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+	}{}
+
+	rows, err := db.Query("SELECT id, name FROM core_import_formats;")
+	if err != nil {
+		http.Error(w, "Failed to retrieve import formats", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var format struct {
+			ID   int    `json:"id"`
+			Name string `json:"name"`
+		}
+		err := rows.Scan(&format.ID, &format.Name)
+		if err != nil {
+			http.Error(w, "Error enumerating import formats", http.StatusInternalServerError)
+			return
+		}
+		formats = append(formats, format)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(formats)
+}
+
+func updateFileFormatHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	fileID := r.FormValue("file_id")
+	formatID := r.FormValue("format_id")
+
+	_, err := db.Exec("UPDATE core_raw_tables SET format_id = $1 WHERE id = $2;", formatID, fileID)
+	if err != nil {
+		http.Error(w, "Failed to set import format", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func getLastSequenceValue(tx *sql.Tx, sequenceName string) (int, error) {
+	if sequenceName == "" {
+		sequenceName = "core_raw_tables_id_seq"
+	}
+	var lastValue int
+	err := tx.QueryRow(`SELECT last_value FROM ` + sequenceName).Scan(&lastValue)
+	if err != nil {
+		return 0, fmt.Errorf("error getting last value from sequence %s: %w", sequenceName, err)
+	}
+	return lastValue, nil
+}
+
+func removeBOM(file io.Reader) io.Reader {
+	const bom = '\uFEFF'
+	buffer := new(bytes.Buffer)
+	reader := bufio.NewReader(file)
+	io.TeeReader(reader, buffer)
+	r, _, err := reader.ReadRune()
+	if err != nil {
+		return file
+	}
+	if r != bom {
+		return io.MultiReader(bytes.NewReader([]byte(string(r))), buffer)
+	}
+	return buffer
+}
+
+func calculateFileHash(file io.Reader) (string, error) {
+	hash := sha256.New()
+	_, err := io.Copy(hash, file)
+	if err != nil {
+		return "", fmt.Errorf("error calculating file hash: %w", err)
+	}
+
+	hashBytes := hash.Sum(nil)
+	return hex.EncodeToString(hashBytes), nil
+}
+
+// TODO: add removal of empty columns
+func trimAndRemoveBOM(file io.Reader) (io.Reader, error) {
+	file = removeBOM(file)
+	return removeEmptyRows(file)
+}
+
+func removeEmptyRows(file io.Reader) (io.Reader, error) {
+	reader := csv.NewReader(file)
+	var cleanedData bytes.Buffer
+	writer := csv.NewWriter(&cleanedData)
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("error reading CSV file: %w", err)
+		}
+
+		// Remove empty rows and columns
+		trimmedRecord := []string{}
+		for _, column := range record {
+			trimmedColumn := strings.TrimSpace(column)
+			if trimmedColumn != "" {
+				trimmedRecord = append(trimmedRecord, trimmedColumn)
+			}
+		}
+
+		if len(trimmedRecord) > 0 {
+			err = writer.Write(trimmedRecord)
+			if err != nil {
+				return nil, fmt.Errorf("error writing cleaned CSV data: %w", err)
+			}
+		}
+	}
+	writer.Flush()
+	return bytes.NewReader(cleanedData.Bytes()), nil
 }
