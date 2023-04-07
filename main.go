@@ -505,7 +505,7 @@ func getLastSequenceValue(ctx context.Context, tx *db.Tx, sequenceName string) (
 		sequenceName = "core_raw_tables_id_seq"
 	}
 	var lastValue int
-	
+
 	err := tx.QueryRowContext(ctx, `SELECT last_value FROM `+sequenceName).Scan(&lastValue)
 	if err != nil {
 		return 0, fmt.Errorf("error getting last value from sequence %s: %w", sequenceName, err)
