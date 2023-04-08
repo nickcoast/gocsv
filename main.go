@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -57,6 +58,9 @@ func main() {
 	r.HandleFunc("/update-file-format", func(w http.ResponseWriter, r *http.Request) {
 		updateFileFormatHandler(w, r, db)
 	}).Methods("GET", "OPTIONS")
+	r.HandleFunc("/files/{fileId}", func(w http.ResponseWriter, r *http.Request) {
+		fetchFileDetails(w, r, db)
+	}).Methods("GET", "OPTIONS")
 
 	/* r.HandleFunc("/upload", handleFileUpload).Methods("POST")
 	r.HandleFunc("/files", fetchUploadedFiles).Methods("GET")
@@ -67,7 +71,7 @@ func main() {
 	// Add CORS middleware
 	c := cors.New(cors.Options{
 		AllowedOrigins:   []string{"http://localhost:3000"}, // Change this to the appropriate origin in production
-		AllowedMethods:   []string{"POST", "GET", "PUT", "DELETE"},
+		AllowedMethods:   []string{"POST", "GET", "PUT", "DELETE", "OPTIONS"},
 		AllowCredentials: true,
 	})
 
@@ -576,4 +580,83 @@ func removeEmptyRows(file io.Reader) (io.Reader, error) {
 	}
 	writer.Flush()
 	return bytes.NewReader(cleanedData.Bytes()), nil
+}
+
+func fetchFileDetails(w http.ResponseWriter, r *http.Request, db *db.DB) {
+	vars := mux.Vars(r)
+	fileId, err := strconv.Atoi(vars["fileId"])
+	if err != nil {
+		http.Error(w, "Invalid file ID", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+
+	tx, err := db.BeginTx(ctx)
+
+	// Retrieve the table name from core_raw_tables based on the file ID
+	var tableName string
+	err = tx.QueryRowContext(ctx, "SELECT name FROM core_raw_tables WHERE id = $1", fileId).Scan(&tableName)
+	if err != nil {
+		http.Error(w, "Error retrieving table name", http.StatusInternalServerError)
+		return
+	}
+
+	// Retrieve column names
+	columns, err := tx.QueryContext(ctx, "SELECT column_name FROM information_schema.columns WHERE table_name = $1", tableName)
+	if err != nil {
+		http.Error(w, "Error retrieving column names", http.StatusInternalServerError)
+		return
+	}
+	defer columns.Close()
+
+	columnNames := make([]string, 0)
+	for columns.Next() {
+		var columnName string
+		if err := columns.Scan(&columnName); err != nil {
+			http.Error(w, "Error reading column names", http.StatusInternalServerError)
+			return
+		}
+		columnNames = append(columnNames, columnName)
+	}
+
+	// Retrieve rows data
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s", tableName))
+	if err != nil {
+		http.Error(w, "Error retrieving rows data", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	rowsData := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		rowData := make(map[string]interface{})
+		values := make([]interface{}, len(columnNames))
+		scanArgs := make([]interface{}, len(columnNames))
+
+		for i := range values {
+			scanArgs[i] = &values[i]
+		}
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			http.Error(w, "Error reading row data", http.StatusInternalServerError)
+			return
+		}
+
+		for i, columnName := range columnNames {
+			rowData[columnName] = values[i]
+		}
+
+		rowsData = append(rowsData, rowData)
+	}
+
+	// Create the response JSON
+	response := map[string]interface{}{
+		"columns": columnNames,
+		"rows":    rowsData,
+	}
+
+	// Send the JSON response
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
