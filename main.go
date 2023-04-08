@@ -621,7 +621,7 @@ func fetchFileDetails(w http.ResponseWriter, r *http.Request, db *db.DB) {
 	}
 
 	// Retrieve rows data
-	rows, err := tx.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s", tableName))
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s LIMIT 100", tableName))
 	if err != nil {
 		http.Error(w, "Error retrieving rows data", http.StatusInternalServerError)
 		return
