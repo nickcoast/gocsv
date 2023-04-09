@@ -1,17 +1,12 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/csv"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -57,7 +52,7 @@ func main() {
 
 	r.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
 		handleFileUpload(w, r, db)
-	}).Methods("POST", "OPTIONS")	
+	}).Methods("POST", "OPTIONS")
 	r.HandleFunc("/files", env.fetchUploadedFiles).Methods("GET", "OPTIONS")
 	r.HandleFunc("/files/{id}", env.deleteFile).Methods("DELETE", "OPTIONS")
 	r.HandleFunc("/import-formats", func(w http.ResponseWriter, r *http.Request) {
@@ -105,16 +100,17 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *models.DB) {
 		return
 	}
 
-	file, handler, err := r.FormFile("file")
+	f, fhead, err := r.FormFile("file")
+	file := &models.File{File: f, Header: fhead}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	defer file.Close()
+	defer file.File.Close()
 
 	// Check the MIME type of the uploaded file
 	buffer := make([]byte, 512)
-	_, err = file.Read(buffer)
+	_, err = file.File.Read(buffer)
 	if err != nil {
 		http.Error(w, "Failed to read file", http.StatusBadRequest)
 		return
@@ -126,7 +122,7 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *models.DB) {
 	}
 
 	if contentType == "text/csv" || contentType == "text/plain; charset=utf-8" {
-		file.Seek(0, 0)
+		file.File.Seek(0, 0)
 		if err != nil {
 			log.Println("Error getting max column lengths:", err)
 			http.Error(w, "Error processing CSV file", http.StatusInternalServerError)
@@ -144,34 +140,34 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *models.DB) {
 		tableName := fmt.Sprintf("raw_table_%d", lastValue+1)
 
 		// Calculate the file hash
-		file.Seek(0, 0)
-		fileHash, err := calculateFileHash(file)
+		file.File.Seek(0, 0)
+		fileHash, err := file.CalculateFileHash(file.File)
 		if err != nil {
 			log.Println("Error calculating file hash:", err)
 			return
 		}
 
 		// Calculate the file hash without BOM
-		file.Seek(0, 0)
-		fileNoBOM := removeBOM(file)
-		fileHashNoBOM, err := calculateFileHash(fileNoBOM)
-		fileTrimmedNoBOM, err := removeEmptyRows(fileNoBOM)
-		fileHashTrimmedNoBOM, err := calculateFileHash(fileTrimmedNoBOM)
+		file.File.Seek(0, 0)
+		fileNoBOM := file.RemoveBOM(file.File)
+		fileHashNoBOM, err := file.CalculateFileHash(fileNoBOM)
+		fileTrimmedNoBOM, err := file.RemoveEmptyRows(fileNoBOM)
+		fileHashTrimmedNoBOM, err := file.CalculateFileHash(fileTrimmedNoBOM)
 		if err != nil {
 			log.Println("Error calculating file hash without BOM:", err)
 			return
 		}
 
 		query := "INSERT INTO core_raw_tables (source_filename, file_size, datetime_uploaded, name, file_hash, file_hash_no_bom, file_hash_trimmed_no_bom) VALUES ($1, $2, $3, $4, $5, $6, $7)" // could add "RETURNING id"
-		_, err = tx.ExecContext(ctx, query, handler.Filename, handler.Size, time.Now(), tableName, fileHash, fileHashNoBOM, fileHashTrimmedNoBOM)
-		fmt.Println(query+"\n", handler.Filename+"\n", handler.Size, handler.Header, time.Now(), tableName+"\n")
+		_, err = tx.ExecContext(ctx, query, fhead.Filename, fhead.Size, time.Now(), tableName, fileHash, fileHashNoBOM, fileHashTrimmedNoBOM)
+		fmt.Println(query+"\n", fhead.Filename+"\n", fhead.Size, fhead.Header, time.Now(), tableName+"\n")
 		if err != nil {
 			fmt.Print(err)
 			http.Error(w, "Failed to save file information to the database", http.StatusInternalServerError)
 			return
 		}
 
-		columnNames, err := createTableForCSV(ctx, tx, file, tableName)
+		columnNames, err := createTableForCSV(ctx, tx, *file, tableName)
 		if err != nil {
 			tx.Rollback()
 			log.Println("Error creating table:", err)
@@ -179,7 +175,7 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *models.DB) {
 			return
 		}
 
-		err = importCSVDataToTable(ctx, tx, file, tableName, columnNames)
+		err = importCSVDataToTable(ctx, tx, *file, tableName, columnNames)
 		if err != nil {
 			log.Println("Error importing data:", err)
 			txErr := tx.Rollback()
@@ -195,27 +191,27 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *models.DB) {
 		w.WriteHeader(http.StatusCreated)
 	}
 
-	_, err = file.Seek(0, io.SeekStart) // Reset the file read position
+	_, err = file.File.Seek(0, io.SeekStart) // Reset the file read position
 	if err != nil {
 		http.Error(w, "Failed to read file", http.StatusBadRequest)
 		return
 	}
 
-	uploadPath := filepath.Join("uploads", handler.Filename)
+	uploadPath := filepath.Join("uploads", fhead.Filename)
 	err = os.MkdirAll(filepath.Dir(uploadPath), os.ModePerm)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	tempFile, err := os.CreateTemp("uploads", handler.Filename+"_tmp_*")
+	tempFile, err := os.CreateTemp("uploads", fhead.Filename+"_tmp_*")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer tempFile.Close()
 
-	fileBytes, err := io.ReadAll(file)
+	fileBytes, err := io.ReadAll(file.File)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -233,7 +229,7 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *models.DB) {
 		return
 	}
 
-	fmt.Fprintf(w, "File uploaded successfully: %s", handler.Filename)
+	fmt.Fprintf(w, "File uploaded successfully: %s", fhead.Filename)
 }
 
 // Add a new function to fetch file information from the database
@@ -247,10 +243,10 @@ func (env *Env) fetchUploadedFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (env *Env) deleteFile(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()	
+	ctx := r.Context()
 	vars := mux.Vars(r)
 	id := vars["id"]
-	idInt, err := strconv.Atoi(id)	
+	idInt, err := strconv.Atoi(id)
 	err = env.upload.Delete(ctx, idInt)
 	if err != nil {
 		http.Error(w, "Failed to delete file", http.StatusInternalServerError)
@@ -263,18 +259,18 @@ func (env *Env) deleteFile(w http.ResponseWriter, r *http.Request) {
 // Returns column names
 // Creates table in DB, skipping completely empty columns and rows
 // For zero-length columns with headers, sets to VARCHAR(1)
-func createTableForCSV(ctx context.Context, tx *models.Tx, file multipart.File, tableName string) ([]string, error) {
+func createTableForCSV(ctx context.Context, tx *models.Tx, file models.File, tableName string) ([]string, error) {
 	// Read the first line of the CSV file to get the column headers
-	file.Seek(0, 0)
-	maxLengths, headerLengths, err := getMaxColumnLengths(file)
+	file.File.Seek(0, 0)
+	maxLengths, headerLengths, err := file.GetMaxColumnLengths()
 	if err != nil {
 		log.Println("Error getting max column lengths:", err)
 		return nil, err
 	}
 	// Reset the reader position before reading headers
-	file.Seek(0, 0)
+	file.File.Seek(0, 0)
 
-	reader := csv.NewReader(file)
+	reader := csv.NewReader(file.File)
 	headers, err := reader.Read()
 	if err != nil {
 		return nil, fmt.Errorf("error reading CSV file: %w", err)
@@ -343,55 +339,16 @@ func toPostgreSQLName(s string) string {
 	return cleanStr
 }
 
-func getMaxColumnLengths(reader io.Reader) ([]int, []int, error) {
-	csvReader := csv.NewReader(reader)
-
-	headerRow, err := csvReader.Read()
-	if err != nil {
-		log.Println("Error reading CSV header:", err)
-		return nil, nil, err
-	}
-
-	maxLengths := []int{}
-	headerLengths := make([]int, len(headerRow))
-	// header row lengths
-	for i, cell := range headerRow {
-		headerLengths[i] = len(cell)
-	}
-
-	for {
-		row, err := csvReader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.Println("Error reading CSV:", err)
-			return nil, nil, err
-		}
-
-		for i, cell := range row {
-			cellLength := len(cell)
-			if i >= len(maxLengths) {
-				maxLengths = append(maxLengths, cellLength)
-			} else if cellLength > maxLengths[i] {
-				maxLengths[i] = cellLength
-			}
-		}
-	}
-
-	return maxLengths, headerLengths, nil
-}
-
-func importCSVDataToTable(ctx context.Context, tx *models.Tx, file multipart.File, tableName string, columnNames []string) error {
+func importCSVDataToTable(ctx context.Context, tx *models.Tx, file models.File, tableName string, columnNames []string) error {
 	// Reset the file position to the beginning
-	file.Seek(0, 0)
+	file.File.Seek(0, 0)
 
 	stmt, err := tx.PrepareContext(ctx, pq.CopyIn(tableName, columnNames...))
 	if err != nil {
 		return fmt.Errorf("error preparing COPY statement: %w", err)
 	}
 
-	reader := csv.NewReader(file)
+	reader := csv.NewReader(file.File)
 	_, err = reader.Read() // Skip header row
 	if err != nil {
 		return fmt.Errorf("error reading CSV file: %w", err)
@@ -490,71 +447,6 @@ func getLastSequenceValue(ctx context.Context, tx *models.Tx, sequenceName strin
 		return 0, fmt.Errorf("error getting last value from sequence %s: %w", sequenceName, err)
 	}
 	return lastValue, nil
-}
-
-func removeBOM(file io.Reader) io.Reader {
-	const bom = '\uFEFF'
-	buffer := new(bytes.Buffer)
-	reader := bufio.NewReader(file)
-	io.TeeReader(reader, buffer)
-	r, _, err := reader.ReadRune()
-	if err != nil {
-		return file
-	}
-	if r != bom {
-		return io.MultiReader(bytes.NewReader([]byte(string(r))), buffer)
-	}
-	return buffer
-}
-
-func calculateFileHash(file io.Reader) (string, error) {
-	hash := sha256.New()
-	_, err := io.Copy(hash, file)
-	if err != nil {
-		return "", fmt.Errorf("error calculating file hash: %w", err)
-	}
-
-	hashBytes := hash.Sum(nil)
-	return hex.EncodeToString(hashBytes), nil
-}
-
-// TODO: add removal of empty columns
-func trimAndRemoveBOM(file io.Reader) (io.Reader, error) {
-	file = removeBOM(file)
-	return removeEmptyRows(file)
-}
-
-func removeEmptyRows(file io.Reader) (io.Reader, error) {
-	reader := csv.NewReader(file)
-	var cleanedData bytes.Buffer
-	writer := csv.NewWriter(&cleanedData)
-	for {
-		record, err := reader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("error reading CSV file: %w", err)
-		}
-
-		// Remove empty rows and columns
-		trimmedRecord := []string{}
-		for _, column := range record {
-			trimmedColumn := strings.TrimSpace(column)
-			if trimmedColumn != "" {
-				trimmedRecord = append(trimmedRecord, trimmedColumn)
-			}
-		}
-
-		if len(trimmedRecord) > 0 {
-			err = writer.Write(trimmedRecord)
-			if err != nil {
-				return nil, fmt.Errorf("error writing cleaned CSV data: %w", err)
-			}
-		}
-	}
-	writer.Flush()
-	return bytes.NewReader(cleanedData.Bytes()), nil
 }
 
 func fetchFileDetails(w http.ResponseWriter, r *http.Request, db *models.DB) {
