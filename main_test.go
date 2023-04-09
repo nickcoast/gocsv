@@ -6,6 +6,11 @@ import (
 	_ "github.com/lib/pq"
 )
 
+/*
+TODO: test for empty rows, empty columns, uneven rows
+test for sql keywords in header and/or rows (e.g. "DESC")
+*/
+
 func Test_toPostgreSQLName(t *testing.T) {
 	type args struct {
 		s string

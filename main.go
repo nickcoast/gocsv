@@ -25,11 +25,11 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
+	"github.com/nickcoast/gocsv/db"
 	"github.com/rs/cors"
 	"golang.org/x/text/runes"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
-	"github.com/nickcoast/gocsv/db"
 )
 
 func main() {
@@ -317,7 +317,7 @@ func createTableForCSV(ctx context.Context, tx *db.Tx, file multipart.File, tabl
 		if columnLength < 1 { // 0-length varchar not allowed in Postgres? (allowed in MySQL)
 			columnLength = 1
 		}
-		columns = append(columns, fmt.Sprintf("%s VARCHAR(%d)", columnName, columnLength))
+		columns = append(columns, fmt.Sprintf("\"%s\" VARCHAR(%d)", columnName, columnLength))
 		columnNames = append(columnNames, columnName)
 	}
 	schema := strings.Join(columns, ", ")
