@@ -22,19 +22,31 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	_ "embed"
+
 	"github.com/gorilla/mux"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
-	"github.com/nickcoast/gocsv/db"
+	"github.com/nickcoast/gocsv/models"
 	"github.com/rs/cors"
 	"golang.org/x/text/runes"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
 )
 
+//go:embed secrets/secrets
+var connStr string
+
+type Env struct {
+	upload models.UploadModel
+}
+
 func main() {
-	connStr := "user=ogrego password=vagrant dbname=ogrego host=localhost sslmode=disable"
-	db, err := db.NewDB(connStr)
+	db, err := models.NewDB(connStr)
+	//var asdf *db.UploadModel
+	env := &Env{
+		upload: models.UploadModel{DB: db},
+	}
 
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
@@ -45,13 +57,9 @@ func main() {
 
 	r.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
 		handleFileUpload(w, r, db)
-	}).Methods("POST", "OPTIONS")
-	r.HandleFunc("/files", func(w http.ResponseWriter, r *http.Request) {
-		fetchUploadedFiles(w, r, db)
-	}).Methods("GET", "OPTIONS")
-	r.HandleFunc("/files/{id}", func(w http.ResponseWriter, r *http.Request) {
-		deleteFile(w, r, db)
-	}).Methods("DELETE", "OPTIONS")
+	}).Methods("POST", "OPTIONS")	
+	r.HandleFunc("/files", env.fetchUploadedFiles).Methods("GET", "OPTIONS")
+	r.HandleFunc("/files/{id}", env.deleteFile).Methods("DELETE", "OPTIONS")
 	r.HandleFunc("/import-formats", func(w http.ResponseWriter, r *http.Request) {
 		getImportFormatsHandler(w, r, db)
 	}).Methods("GET", "OPTIONS")
@@ -82,7 +90,7 @@ func main() {
 	log.Fatal(http.ListenAndServe(port, handler))
 }
 
-func handleFileUpload(w http.ResponseWriter, r *http.Request, db *db.DB) {
+func handleFileUpload(w http.ResponseWriter, r *http.Request, db *models.DB) {
 	ctx := r.Context()
 	tx, err := db.BeginTx(ctx)
 	if err != nil {
@@ -229,58 +237,25 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, db *db.DB) {
 }
 
 // Add a new function to fetch file information from the database
-func fetchUploadedFiles(w http.ResponseWriter, r *http.Request, db *db.DB) {
+func (env *Env) fetchUploadedFiles(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	query := `SELECT u.id, u.source_filename, u.file_size, u.datetime_uploaded, COALESCE(c.name, '') as format_name
-	FROM core_raw_tables u
-	LEFT JOIN core_import_formats c ON u.format_id = c.id
-	ORDER BY u.datetime_uploaded DESC;`
-	rows, err := db.QueryWithContext(ctx, query)
+	uploads, err := env.upload.All(ctx)
 	if err != nil {
-		http.Error(w, "Failed to fetch file information from the database", http.StatusInternalServerError)
-		return
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
-	defer rows.Close()
-
-	type FileInfo struct {
-		Id               int64     `json:"id"`
-		FileName         string    `json:"source_filename"`
-		FileSize         int64     `json:"file_size"`
-		ImportFormat     string    `json:"format_name"`
-		DatetimeUploaded time.Time `json:"datetime_uploaded"`
-	}
-
-	fileInfos := []FileInfo{}
-
-	for rows.Next() {
-		var fileInfo FileInfo
-		err := rows.Scan(&fileInfo.Id, &fileInfo.FileName, &fileInfo.FileSize, &fileInfo.DatetimeUploaded, &fileInfo.ImportFormat)
-		if err != nil {
-			http.Error(w, "Failed to read file information from the database", http.StatusInternalServerError)
-			return
-		}
-		fileInfos = append(fileInfos, fileInfo)
-	}
-
-	json.NewEncoder(w).Encode(fileInfos)
+	json.NewEncoder(w).Encode(uploads)
 }
 
-func deleteFile(w http.ResponseWriter, r *http.Request, db *db.DB) {
-	ctx := r.Context()
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		http.Error(w, "Error starting transaction", http.StatusInternalServerError)
-		return
-	}
+func (env *Env) deleteFile(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()	
 	vars := mux.Vars(r)
 	id := vars["id"]
-
-	_, err = tx.ExecContext(ctx, "DELETE FROM core_raw_tables WHERE id = $1", id)
+	idInt, err := strconv.Atoi(id)	
+	err = env.upload.Delete(ctx, idInt)
 	if err != nil {
 		http.Error(w, "Failed to delete file", http.StatusInternalServerError)
 		return
 	}
-
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("File deleted successfully"))
 }
@@ -288,7 +263,7 @@ func deleteFile(w http.ResponseWriter, r *http.Request, db *db.DB) {
 // Returns column names
 // Creates table in DB, skipping completely empty columns and rows
 // For zero-length columns with headers, sets to VARCHAR(1)
-func createTableForCSV(ctx context.Context, tx *db.Tx, file multipart.File, tableName string) ([]string, error) {
+func createTableForCSV(ctx context.Context, tx *models.Tx, file multipart.File, tableName string) ([]string, error) {
 	// Read the first line of the CSV file to get the column headers
 	file.Seek(0, 0)
 	maxLengths, headerLengths, err := getMaxColumnLengths(file)
@@ -407,7 +382,7 @@ func getMaxColumnLengths(reader io.Reader) ([]int, []int, error) {
 	return maxLengths, headerLengths, nil
 }
 
-func importCSVDataToTable(ctx context.Context, tx *db.Tx, file multipart.File, tableName string, columnNames []string) error {
+func importCSVDataToTable(ctx context.Context, tx *models.Tx, file multipart.File, tableName string, columnNames []string) error {
 	// Reset the file position to the beginning
 	file.Seek(0, 0)
 
@@ -456,7 +431,7 @@ func importCSVDataToTable(ctx context.Context, tx *db.Tx, file multipart.File, t
 	return nil
 }
 
-func getImportFormatsHandler(w http.ResponseWriter, r *http.Request, db *db.DB) {
+func getImportFormatsHandler(w http.ResponseWriter, r *http.Request, db *models.DB) {
 	formats := []struct {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
@@ -488,7 +463,7 @@ func getImportFormatsHandler(w http.ResponseWriter, r *http.Request, db *db.DB) 
 	json.NewEncoder(w).Encode(formats)
 }
 
-func updateFileFormatHandler(w http.ResponseWriter, r *http.Request, db *db.DB) {
+func updateFileFormatHandler(w http.ResponseWriter, r *http.Request, db *models.DB) {
 	fileID := r.FormValue("file_id")
 	formatID := r.FormValue("format_id")
 
@@ -504,7 +479,7 @@ func updateFileFormatHandler(w http.ResponseWriter, r *http.Request, db *db.DB) 
 	w.WriteHeader(http.StatusOK)
 }
 
-func getLastSequenceValue(ctx context.Context, tx *db.Tx, sequenceName string) (int, error) {
+func getLastSequenceValue(ctx context.Context, tx *models.Tx, sequenceName string) (int, error) {
 	if sequenceName == "" {
 		sequenceName = "core_raw_tables_id_seq"
 	}
@@ -582,7 +557,7 @@ func removeEmptyRows(file io.Reader) (io.Reader, error) {
 	return bytes.NewReader(cleanedData.Bytes()), nil
 }
 
-func fetchFileDetails(w http.ResponseWriter, r *http.Request, db *db.DB) {
+func fetchFileDetails(w http.ResponseWriter, r *http.Request, db *models.DB) {
 	vars := mux.Vars(r)
 	fileId, err := strconv.Atoi(vars["fileId"])
 	if err != nil {
