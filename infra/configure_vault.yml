@@ -1,0 +1,10 @@
+---
+- name: Install HashiCorp Vault
+  include_tasks: install_vault.yml
+  tags:
+    - vault
+
+- name: Configure HashiCorp Vault
+  include_tasks: setup_vault.yml
+  tags:
+    - vault

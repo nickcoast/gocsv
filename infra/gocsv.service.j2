@@ -1,0 +1,13 @@
+[Unit]
+Description=Go CSV App
+After=network.target postgresql.service
+
+[Service]
+User=ubuntu
+Environment="DB_HOST=localhost" "DB_PORT=5432" "DB_NAME=gocsv_db" "DB_USER=gocsv_user" "DB_PASSWORD="{{ postgres_password }}""
+WorkingDirectory=/home/ubuntu/go/bin
+ExecStart=/home/ubuntu/go/bin/gocsv
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

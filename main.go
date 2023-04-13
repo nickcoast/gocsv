@@ -20,6 +20,7 @@ import (
 	_ "embed"
 
 	"github.com/gorilla/mux"
+	vault "github.com/hashicorp/vault/api"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 	"github.com/nickcoast/gocsv/models"
@@ -29,14 +30,21 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
-//go:embed secrets/secrets
-var connStr string
-
 type Env struct {
 	upload models.UploadModel
 }
 
 func main() {
+	// user=ogrego password=vagrant dbname=ogrego host=localhost sslmode=disable
+	postgresCredentials, err := getPostgresCredentials()
+	if err != nil {
+		log.Fatalf("Failed to get the PostgreSQL password: %v", err)
+	}
+	//postgresDB := "ogrecsv"
+	postgresDB := "ogrego"
+
+	connStr := fmt.Sprintf("user=%s password=%s dbname=%s host=localhost sslmode=disable", postgresCredentials.Username, postgresCredentials.Password, postgresDB)
+
 	db, err := models.NewDB(connStr)
 	//var asdf *db.UploadModel
 	env := &Env{
@@ -83,6 +91,120 @@ func main() {
 	port := ":8080"
 	fmt.Println("Listening on port", port)
 	log.Fatal(http.ListenAndServe(port, handler))
+}
+
+type PostgresCredentials struct {
+	Username string
+	Password string
+}
+
+func getPostgresCredentials() (PostgresCredentials, error) {
+	// Check environment variables for PostgreSQL credentials
+	username := os.Getenv("DB_USER")
+	password := os.Getenv("DB_PASSWORD")
+
+	// If credentials are found in environment variables, return them
+	if username != "" && password != "" {
+		return PostgresCredentials{
+			Username: username,
+			Password: password,
+		}, nil
+	}
+
+	// If credentials are not found in environment variables, try fetching from Vault
+	vaultAddr := os.Getenv("VAULT_ADDR")
+	vaultToken := os.Getenv("VAULT_TOKEN")
+	// vaultSecretID := os.Getenv("VAULT_SECRET_ID")
+
+	config := &vault.Config{
+		Address: vaultAddr,
+	}
+
+	client, err := vault.NewClient(config)
+	if err != nil {
+		return PostgresCredentials{}, fmt.Errorf("failed to create Vault client: %v", err)
+	}
+
+	client.SetToken(vaultToken)
+
+	// Fetch dynamic credentials from the database secrets engine
+	secret, err := client.Logical().Read("database/creds/gocsvdb")
+	if err != nil {
+		return PostgresCredentials{}, fmt.Errorf("failed to read secret from Vault: %v", err)
+	}
+
+	if secret == nil || secret.Data == nil {
+		return PostgresCredentials{}, fmt.Errorf("no data in the secret")
+	}
+
+	username, ok := secret.Data["username"].(string)
+	if !ok {
+		return PostgresCredentials{}, fmt.Errorf("no username in the secret data")
+	}
+
+	password, ok = secret.Data["password"].(string)
+	if !ok {
+		return PostgresCredentials{}, fmt.Errorf("no password in the secret data")
+	}
+
+	return PostgresCredentials{
+		Username: username,
+		Password: password,
+	}, nil
+}
+
+// Generic key retrieval. TODO: use this in getPostgresCredentials
+func getSecret(key string) (string, error) {
+	// Try to get the secret from environment variables
+	secret := os.Getenv(key)
+	if secret != "" {
+		return secret, nil
+	}
+
+	// If the secret is not in the environment variables, try to get it from Vault
+	vaultAddr := os.Getenv("VAULT_ADDR")
+	vaultToken := os.Getenv("VAULT_TOKEN")
+	vaultSecretID := os.Getenv("VAULT_SECRET_ID")
+
+	if vaultAddr == "" || vaultToken == "" {
+		return "", fmt.Errorf("Secret %s not found in environment variables or Vault configuration", key)
+	}
+
+	// Create a Vault client
+	client, err := vault.NewClient(&vault.Config{Address: vaultAddr})
+	if err != nil {
+		return "", fmt.Errorf("Failed to create Vault client: %v", err)
+	}
+
+	// Authenticate with Vault
+	if vaultSecretID != "" {
+		// AppRole authentication
+		secret, err := client.Logical().Write("auth/approle/login", map[string]interface{}{
+			"role_id":   vaultToken,
+			"secret_id": vaultSecretID,
+		})
+		if err != nil {
+			return "", fmt.Errorf("Failed to log in with AppRole: %v", err)
+		}
+		client.SetToken(secret.Auth.ClientToken)
+	} else {
+		// Token authentication
+		client.SetToken(vaultToken)
+	}
+
+	// Read the secret from Vault
+	vaultSecret, err := client.Logical().Read("secret/gocsvdb")
+	if err != nil {
+		return "", fmt.Errorf("Failed to read secret from Vault: %v", err)
+	}
+
+	// Get the secret value
+	secretValue, ok := vaultSecret.Data[key].(string)
+	if !ok {
+		return "", fmt.Errorf("Secret %s not found in Vault", key)
+	}
+
+	return secretValue, nil
 }
 
 func handleFileUpload(w http.ResponseWriter, r *http.Request, db *models.DB) {
