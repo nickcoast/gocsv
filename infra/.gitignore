@@ -1,5 +1,6 @@
 apps/
 .vault
+inventory.ini
 prod-hosts.ini
 config/server/demo.env.j2
 

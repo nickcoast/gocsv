@@ -1,17 +1,15 @@
 ---
-- name: Deploy Go repo to EC2 instance
-  hosts: ec2
+- name: Deploy Go repo to Ubuntu instance
+  hosts: ubuntu
   become: yes
+  gather_facts: yes
 
-
-  vars_files:
-    - vault.yml
-
-  tasks:
+  tasks:      
     - name: Update package list and install required packages
-      ansible.builtin.yum:
-        name: ['git', 'golang', 'postgresql', 'postgresql-server', 'postgresql-contrib']
+      ansible.builtin.apt:
+        name: ['git', 'golang', 'postgresql', 'postgresql-contrib']
         state: latest
+        update_cache: yes
 
     - name: Set GOPATH
       ansible.builtin.lineinfile:
@@ -31,13 +29,10 @@
         cmd: go build -o /home/ubuntu/go/bin/gocsv
         chdir: /home/ubuntu/go/src/gocsv
 
-    - name: Initialize PostgreSQL database
-      command: postgresql-setup initdb
-
     - name: Configure PostgreSQL to allow password authentication
       replace:
-        path: /var/lib/pgsql/data/pg_hba.conf
-        regexp: '^host.*all.*all.*127\.0\.0\.1/32.*ident'
+        path: /etc/postgresql/{{ ansible_facts.postgresql_version }}/main/pg_hba.conf
+        regexp: '^host.*all.*all.*127\.0\.0\.1/32.*peer'
         replace: 'host all all 127.0.0.1/32 md5'
         backup: yes
 
@@ -77,3 +72,20 @@
         name: gocsv
         state: started
         enabled: yes
+
+    - name: Install and configure HashiCorp Vault (optional)
+      block:
+        - name: Add HashiCorp repository
+          ansible.builtin.apt_repository:
+            repo: 'deb [arch=amd64] https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main'
+            state: present
+            filename: hashicorp
+
+        - name: Install HashiCorp Vault
+          ansible.builtin.apt:
+            name: vault
+            state: latest
+            update_cache: yes
+
+        # Configure Vault as needed
+      when: install_vault | default(false) | bool
