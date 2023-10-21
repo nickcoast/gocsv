@@ -137,6 +137,10 @@ func getPostgresCredentials() (PostgresCredentials, error) {
 		return PostgresCredentials{}, fmt.Errorf("no data in the secret")
 	}
 
+	leaseID := secret.LeaseID
+	fmt.Print(("leaseID retrieved: "))
+	fmt.Print(leaseID)
+
 	username, ok := secret.Data["username"].(string)
 	if !ok {
 		return PostgresCredentials{}, fmt.Errorf("no username in the secret data")

@@ -3,8 +3,11 @@
   hosts: ubuntu
   become: yes
   gather_facts: yes
-
-  tasks:      
+   
+  tasks:
+    - name: Gather package facts
+      ansible.builtin.package_facts:
+        manager: auto
     - name: Update package list and install required packages
       ansible.builtin.apt:
         name: ['git', 'golang', 'postgresql', 'postgresql-contrib']
@@ -29,9 +32,14 @@
         cmd: go build -o /home/ubuntu/go/bin/gocsv
         chdir: /home/ubuntu/go/src/gocsv
 
+    - name: Set PostgreSQL version variable
+      set_fact:
+        postgresql_version: "{{ ansible_facts.packages['postgresql'][0].version.split('.')[0] }}"
+
+
     - name: Configure PostgreSQL to allow password authentication
       replace:
-        path: /etc/postgresql/{{ ansible_facts.postgresql_version }}/main/pg_hba.conf
+        path: "/etc/postgresql/{{ postgresql_version }}/main/pg_hba.conf"
         regexp: '^host.*all.*all.*127\.0\.0\.1/32.*peer'
         replace: 'host all all 127.0.0.1/32 md5'
         backup: yes

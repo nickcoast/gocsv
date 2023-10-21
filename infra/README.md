@@ -16,3 +16,8 @@ infra/ $ ansible-playbook -i inventory.ini deploy.yml --tags "vault"
 Deploy without Vault (fall back to environment variables):
 
 infra/ $ ansible-playbook -i inventory.ini deploy.yml
+
+
+
+
+Copy inventory.ini_sample to inventory.ini and insert your own values.
